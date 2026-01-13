@@ -65,6 +65,9 @@ class BiEncoder(PreTrainedModel):
     - 与索引系统集成
     """
     config_class = BiEncoderConfig
+    print('============================================')
+    print(BiEncoderConfig)
+    print('============================================')
 
     def __init__(self, config: BiEncoderConfig, **kwargs):
         """

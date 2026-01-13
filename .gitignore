@@ -1,2 +1,4 @@
 data/
 !src/ir/data/
+*.pyc
+__pycache__/
