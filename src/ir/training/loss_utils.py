@@ -16,12 +16,40 @@ logger = logging.getLogger(__name__)
 
 
 def fetch_global_vectors(emb_local, bow_local, k=768):
+    """
+    在分布式训练中收集全局向量
+    
+    分布式训练时，每个GPU只有本地的batch数据。为了计算对比损失，
+    需要收集所有GPU的数据作为负采样。
+    
+    Args:
+        emb_local: 本地GPU的稀密向量 [local_batch, vocab_size]
+        bow_local: 本地GPU的BOW向量 [local_batch, vocab_size]
+        k: Top-K稀疏化参数
+    
+    Returns:
+        emb_dense_global: 全局稀密向量 [global_batch, vocab_size]
+        emb_sparse_global: 全局稀疏向量 [global_batch, vocab_size]
+        bow_global: 全局BOW向量 [global_batch, vocab_size]
+    
+    工作流程：
+    1. 构建top-k mask并与BOW mask合并
+    2. 应用mask得到稀疏向量
+    3. 使用GatherLayer收集所有GPU的向量
+    """
+    # Step 1: 构建Top-K mask
     topk_mask = build_topk_mask(emb_local, k=k)
+    # Step 2: 与BOW mask合并（并集），确保输入token被激活
     topk_mask = torch.logical_or(topk_mask, bow_local)
+    # Step 3: 应用mask得到稀疏向量
     emb_sparse_local = emb_local * topk_mask
+    
+    # Step 4: 使用GatherLayer收集所有GPU的向量
+    # GatherLayer.apply会自动处理梯度传播
     emb_sparse_global = torch.cat(GatherLayer.apply(emb_sparse_local), dim=0)
     emb_dense_global = torch.cat(GatherLayer.apply(emb_local), dim=0)
     bow_global = torch.cat(GatherLayer.apply(bow_local), dim=0)
+    
     return emb_dense_global, emb_sparse_global, bow_global
 
 def _do_biencoder_fwd_pass(
@@ -124,21 +152,58 @@ def compute_vdr_loss(
     logger=None,
     answers=None,
 ) -> Tuple[T, bool]:
+    """
+    计算VDR的训练损失
+    
+    VDR的核心创新：半参数化(Semi-parametric)检索损失
+    结合两种表示：
+    1. 参数化表示：通过神经网络学到的语义表示（Top-K mask）
+    2. 非参数化表示：精确的词汇匹配（BOW mask）
+    
+    训练目标：
+    - loss_1: query的语义表示 × passage的完整表示
+    - loss_2: query的完整表示 × passage的语义表示
+    - loss_3: query的BOW表示 × passage的完整表示
+    - loss_4: query的完整表示 × passage的BOW表示
+    
+    最终损失 = (loss_1 + loss_2 + loss_3 + loss_4) / 4
+    
+    Args:
+        cfg: 配置对象
+        q_emb_local: 查询嵌入(本地) [local_batch, vocab_size]
+        p_emb_local: 文档嵌入(本地) [local_batch, num_passages, vocab_size]
+        q_bin_local: 查询BOW表示(本地)
+        p_bin_local: 文档BOW表示(本地)
+        verbose: 是否输出详细信息
+        ...: 其他可选参数用于调试
+    
+    Returns:
+        loss: 总损失
+        is_correct_semiparametric: 半参数化模式的准确率
+        is_correct_parametric: 参数化模式的准确率
+    """
 
+    # 验证梯度已启用
     assert q_emb_local.requires_grad_ and p_emb_local.requires_grad_
-    N, V = q_emb_local.shape
+    N, V = q_emb_local.shape  # N: 本地batch大小, V: 词汇表大小
 
+    # Step 1: 重整passage的形状
+    # 从 [local_batch*num_passages, vocab_size] → [local_batch, num_passages, vocab_size]
     p_emb_local = p_emb_local.view(-1, N, V).permute(1, 0, 2).contiguous()
     p_bin_local = p_bin_local.view(-1, N, V).permute(1, 0, 2).contiguous()
 
+    # Step 2: 收集全局向量（跨GPU）
+    # 这是分布式训练的关键：使用所有GPU的数据作为负采样
     q_emb_global, q_emb_topk_global, q_bin_global = fetch_global_vectors(q_emb_local, q_bin_local)
     p_emb_global, p_emb_topk_global, p_bin_global = fetch_global_vectors(p_emb_local, p_bin_local)
     
+    # Step 3: 重整passage的形状为二维
+    # [global_batch, num_passages, vocab_size] → [global_batch*num_passages, vocab_size]
     p_emb_global = p_emb_global.permute(1, 0, 2).contiguous().view(-1, V)
     p_emb_topk_global = p_emb_topk_global.permute(1, 0, 2).contiguous().view(-1, V)
     p_bin_global = p_bin_global.permute(1, 0, 2).contiguous().view(-1, V)
 
-    N_global = q_emb_global.shape[0]
+    N_global = q_emb_global.shape[0]  # 全局batch大小
 
     if cfg.local_rank in [-1,0] and verbose:
         sample_id = 0
@@ -173,32 +238,54 @@ def compute_vdr_loss(
         info_card.wrap_info()
         logger.info(info_card.info)
 
+    # Step 5: 选择损失函数：对称或普通的对比学习损失
     retrieval_loss_func = SymmetryBiEncoderNllLoss() if cfg.train.sym_loss else BiEncoderNllLoss()
 
     if getattr(cfg.train, "semi", True):
+        # 半参数化模式（VDR标准设置）
+        # 计算四个损失项，结合参数化和非参数化表示
+        
+        # Loss 1: query的语义表示 (top-k) × passage的完整表示 (稀密)
+        # 目标：学习语义上相关的词汇
         loss_1, is_correct_1 = retrieval_loss_func.calc(q_emb_topk_global, p_emb_global)
+        
+        # Loss 2: query的完整表示 × passage的语义表示 (top-k)
+        # 目标：从另一个方向学习语义关联
         loss_2, is_correct_2 = retrieval_loss_func.calc(q_emb_global, p_emb_topk_global)
         
+        # 可选：对比掩码 (Contrastive Mask)
+        # 用于增强负采样，避免词汇冲突
         if getattr(cfg.train, "cts_mask", None):
+            # 为query构建对比掩码
             cts_mask_activate = build_cts_mask(q_bin_global)
             cts_mask_deactivate = torch.ones_like(p_emb_global).to(cfg.device)
             cts_mask_deactivate[:N_global] = ~cts_mask_activate
+            
+            # 归一化掩码并加权
             cts_mask_activate_norm = F.normalize(cts_mask_activate.float()) if cfg.train.cts_mask_norm else cts_mask_activate.float()
             q_bin_global = q_bin_global + cts_mask_activate_norm * cfg.train.cts_mask_weight
             p_emb_global = p_emb_global * cts_mask_deactivate
 
+            # 为passage构建对比掩码
             cts_mask_activate = build_cts_mask(p_bin_global)
             cts_mask_deactivate = ~cts_mask_activate[:N_global]
             cts_mask_activate_norm = F.normalize(cts_mask_activate.float()) if cfg.train.cts_mask_norm else cts_mask_activate.float()            
             p_bin_global = p_bin_global + cts_mask_activate_norm * cfg.train.cts_mask_weight
             q_emb_global = q_emb_global * cts_mask_deactivate
 
+        # Loss 3: query的BOW表示 × passage的完整表示
+        # 目标：学习精确的词汇匹配
         loss_3, is_correct_3 = retrieval_loss_func.calc(q_bin_global, p_emb_global)
+        
+        # Loss 4: query的完整表示 × passage的BOW表示
+        # 目标：从另一个方向学习词汇匹配
         loss_4, is_correct_4 = retrieval_loss_func.calc(q_emb_global, p_bin_global)
 
+        # 综合所有损失
         loss = (loss_1 + loss_2 + loss_3 + loss_4) / 4
-        is_correct_parametric = (is_correct_1 + is_correct_2) / 2
-        is_correct_semiparametric = (is_correct_3 + is_correct_4) / 2
+        # 计算两种模式的准确率
+        is_correct_parametric = (is_correct_1 + is_correct_2) / 2  # 参数化模式
+        is_correct_semiparametric = (is_correct_3 + is_correct_4) / 2  # 半参数化模式
         
     else:
         loss_1, is_correct_1 = retrieval_loss_func.calc(q_emb_topk_global, p_emb_global)

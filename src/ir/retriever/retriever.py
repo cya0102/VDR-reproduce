@@ -19,6 +19,19 @@ class RetrieverConfig(BiEncoderConfig):
 
 
 class Retriever(BiEncoder):
+    """
+    检索器：在BiEncoder基础上添加检索功能
+    
+    整合了编码器和索引系统，实现完整的检索流程：
+    1. 编码查询
+    2. 从索引中检索top-k相关文档
+    3. （训练时）检索负样本
+    
+    支持多种检索模式：
+    - 稠密检索：topk=-1，使用全部维度
+    - 稀疏检索：topk=K，仅使用top-K维度
+    - BOW检索：topk=0，仅使用词汇匹配
+    """
     config_class = RetrieverConfig
 
     def __init__(
@@ -26,6 +39,13 @@ class Retriever(BiEncoder):
         index: Index = None, 
         **kwargs
     ):
+        """
+        初始化检索器
+        
+        Args:
+            config: 检索器配置
+            index: 索引对象（可选），用于高效检索
+        """
         super().__init__(config, **kwargs)
         self.config = config
         self.index = index
@@ -38,28 +58,53 @@ class Retriever(BiEncoder):
         a: int = None, 
         index: Index = None
     ) -> SearchResults:
+        """
+        检索相关文档
+        
+        支持多种输入格式：
+        1. 文本列表：自动编码后检索
+        2. numpy数组：直接使用预计算的向量
+        3. PyTorch Tensor：直接使用
+        
+        Args:
+            queries: 查询文本、嵌入向量或Tensor
+            k: 返回的top-k文档数量
+            dropout: 在查询向量上应用的dropout比例（用于数据增强）
+            a: 稀疏化参数，默认使用encoder_q.config.topk
+            index: 索引对象，默认使用self.index
+        
+        Returns:
+            SearchResults: 检索结果，包含文档ID和分数
+        """
         index = index or self.index
         a = a or self.encoder_q.config.topk
         
+        # 处理不同类型的输入
         if isinstance(queries, list) and isinstance(queries[0], str):
+            # 文本输入：编码为向量
             if a == 0:
+                # BOW模式
                 q_embs = self.encoder_q.embed(queries)
                 q_embs = F.dropout(q_embs, p=dropout)
             else:
+                # 稀疏或稀密模式
                 q_embs = self.encoder_q.embed(queries, topk=a)
                 q_embs = F.dropout(q_embs, p=dropout)
         elif isinstance(queries, np.ndarray):
+            # NumPy数组输入
             q_embs = queries
             q_embs = torch.Tensor(q_embs)
             if dropout:
                 q_embs = F.dropout(q_embs, p=dropout)
         elif isinstance(queries, T):
+            # Tensor输入
             q_embs = queries
             if dropout:
                 q_embs = F.dropout(q_embs, p=dropout)
         else:
             raise NotImplementedError
         
+        # 从索引中检索
         results = self.index.search(q_embs, k=k)
         return results
     
