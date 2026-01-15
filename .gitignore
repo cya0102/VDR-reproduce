@@ -2,3 +2,7 @@ data/
 !src/ir/data/
 *.pyc
 __pycache__/
+README_glove_vdr.md
+test_image_encoder_glove.py
+test_image_encoder.py
+vdr_image_encoder_glove.py
