@@ -8,7 +8,7 @@ encoder_q:
   max_len: 128
   norm: False
   shift_vocab_num: 999
-  topk: 768
+  topk: 500
   pooling: max
   pooling_topk: 
 
@@ -18,6 +18,6 @@ encoder_p:
   max_len: 256
   norm: False
   shift_vocab_num: 999
-  topk: 768
+  topk: 500
   pooling: max
   pooling_topk: 

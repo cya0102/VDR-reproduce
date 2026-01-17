@@ -280,7 +280,7 @@ class VDREncoder(PreTrainedModel):
             self.train()
         return emb
 
-    def disentangle(self, text: str, topk: int = 768, visual=False, save_file=None):
+    def disentangle(self, text: str, topk: int = 500, visual=False, save_file=None):
         """
         解缠文本表示：将文本分解为最相关的词汇及其权重
         

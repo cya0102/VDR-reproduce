@@ -310,10 +310,10 @@ class VDRImageEncoderConfig(PretrainedConfig):
         resolution=224,
         tokenizer_id="bert-base-uncased",
         patch_size=32,
-        width=768,
+        width=500,
         layers=12,
         heads=12, 
-        topk=768,
+        topk=500,
         **kwargs,
     ):
         """初始化配置
